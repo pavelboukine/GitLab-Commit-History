@@ -396,3 +396,256 @@ pub async fn delete_data_paths(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use chrono::Utc;
+    use models::{
+        data::mapper::from_compressed_session_file,
+        sessions::{Visit, SessionData, TEST_USER_AGENT_IPHONE},
+    };
+    use uuid::Uuid;
+
+    /// This test simulates the data_compressor service's processing of a Pub/Sub message, representing a new SessionData needing compression.
+    /// It validates the service's ability to parse the message, retrieve and decompress the SessionData from cloud storage,
+    /// compress the session data after processing, and write the compressed data to the expected location, ensuring end-to-end functionality.
+    #[tokio::test]
+    async fn test_data_compressor_streaming() {
+        // Authenticate with cloud service and enable the Pub/Sub emulator
+        let service_account = gcp::auth().expect("Failed to authenticate with cloud service");
+
+        let _pubsub_emulator_host = gcp::pubsub::enable_emulator();
+
+        // Setup Pub/Sub client, topic, and subscription for the test
+        let pubsub_client = cloud_pubsub::Client::new(service_account)
+            .await
+            .expect("Failed to create Pub/Sub client");
+
+        let topic_name = format!("test_data_compressor-{}", Uuid::new_v4());
+
+        gcp::pubsub::create_test_topic(
+            &topic_name,
+            &pubsub_client.project(),
+            &_pubsub_emulator_host,
+        )
+        .await
+        .expect("Failed to create test topic");
+
+        let topic = pubsub_client.topic(topic_name);
+        let subscription = topic
+            .subscribe()
+            .await
+            .expect("Failed to create subscription");
+
+        // Setup a shutdown mechanism for gracefully ending the test
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+        let shutdown_token = ShutdownToken::new_test(shutdown_receiver);
+        let mock_metrics = Arc::new(MockMetrics) as Arc<dyn MetricsTrait>;
+        // Start the data_compressor service
+        tokio::spawn(async move {
+            pubsub_streamer(mock_metrics, subscription, shutdown_token)
+                .await
+                .expect("Service failed");
+        });
+
+        // Create a mock SessionData object
+        let mut session_data = SessionData::new("www.example.com", TEST_USER_AGENT_IPHONE);
+        let visit1 = Visit::new(
+            "https://www.example.com/checkout/success",
+            TEST_USER_AGENT_IPHONE,
+        );
+        let visit2 = Visit::new(
+            "https://www.example.com/checkout/other",
+            TEST_USER_AGENT_IPHONE,
+        );
+
+        // Add visits to the session data
+        session_data.add_visit(&visit1);
+        session_data.add_visit(&visit2);
+
+        // Define the path where the session data will be saved in cloud storage
+        let storage_path = format!("2024/3/8/www.example.com/{}.jsonz", Uuid::new_v4());
+        // Define the path where the uncompressed data will be saved (mocking the existing storage structure)
+        let now = Utc::now().naive_utc();
+        for visit in session_data.visits.iter() {
+            let raw_data_dir = models::data::query::raw_data_dir(now, &session_data.on_domain, true);
+            // Ensure the directory structure exists for the legacy path
+            if let Err(e) = fs::create_dir_all(&raw_data_dir) {
+                log::error!("Failed to create directory for raw data: {}", e);
+                continue; // Skip this Visit and move to the next one
+            }
+
+            let raw_data_path = raw_data_dir.join(format!("{}.json", visit.id));
+
+            // Create dummy JSON data representing the data for the Visit
+            let dummy_data = serde_json::json!({
+                "data": {
+                    "0": {
+                        "payload": "Legacy payload",
+                        "response": "Legacy response",
+                        "request_headers": [],
+                        "response_headers": []
+                    }
+                }
+            })
+            .to_string();
+
+            // Write the mock data to the raw data path
+            match fs::File::create(&raw_data_path) {
+                Ok(mut file) => {
+                    if let Err(e) = file.write_all(dummy_data.as_bytes()) {
+                        log::error!("Failed to write mock data for visit_id {}: {}", visit.id, e);
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to create file for visit_id {}: {}", visit.id, e);
+                }
+            }
+        }
+
+        // Save the mock session data to cloud storage using the save_to_storage function
+        session_data
+            .save_to_storage(&storage_path)
+            .await
+            .expect("Failed to save mock session data to cloud storage");
+
+        // Publish a test message to the topic to simulate receiving a message
+        let attributes: HashMap<String, String> = [
+            ("eventType", "OBJECT_FINALIZE"),
+            ("objectId", &storage_path),
+            // Include other necessary attributes for your service here
+        ]
+        .iter()
+        .cloned()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        topic
+            .publish("none".as_bytes(), Some(attributes))
+            .await
+            .expect("Failed to publish test message");
+
+        // Allow some time for the message to be processed
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        // Trigger a graceful shutdown to end the test
+        shutdown_sender
+            .send(())
+            .expect("Failed to send shutdown signal");
+
+        let mock_session_id = session_data.id; // Capture the session ID used by the service
+
+        // Ensure the expected output path uses the same session ID
+        let expected_output_path = models::data::query::compressed_data_dir(
+            now, // Use the current date as it seems the service does
+            "www.example.com",
+            true,
+        )
+        .join(format!("{mock_session_id}.jsonz"));
+
+        // Use the from_compressed_session_file method to directly get the decompressed data
+        let decompressed_data = from_compressed_session_file(&expected_output_path)
+            .await
+            .expect("Failed to decompress and deserialize the data");
+
+        // Ensure all Visits are included in the compressed data
+        for visit in session_data.visits.iter() {
+            assert!(
+                decompressed_data.contains_key(&visit.id),
+                "Aggregated data missing for Visit ID: {}",
+                visit.id
+            );
+        }
+
+        // Cleanup logic at the end of the test
+        if fs::metadata(&expected_output_path).is_ok() {
+            fs::remove_file(&expected_output_path)
+                .expect("Failed to clean up the compressed data file");
+        }
+    }
+
+    /// Tests the delete function in the compressor
+    #[tokio::test]
+    async fn test_delete_old_data() {
+        // Create a temporary directory to act as the output directory for this test
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let temp_dir_path = temp_dir
+            .path()
+            .to_str()
+            .expect("Failed to convert temp dir path to string");
+
+        // Set the OUTPUT_DIR environment variable to the path of the temporary directory
+        std::env::set_var("OUTPUT_DIR", temp_dir_path);
+
+        // Generate UUIDs for visits and create a unique directory for each
+        let visit_ids = vec![Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let datetime = Utc::now().naive_utc();
+        let domain_name = "testdomain.com";
+        let mut paths_to_delete = Vec::new();
+
+        for &visit_id in &visit_ids {
+            let path = get_raw_data_path(datetime, domain_name, visit_id, true)
+                .await
+                .unwrap();
+            // Write dummy data to simulate existing files
+            std::fs::write(&path, b"dummy data").expect("Failed to write dummy data");
+            paths_to_delete.push(path);
+        }
+
+        // Add a non-existent file path to induce a deletion failure
+        let non_existent_path = temp_dir.path().join("non_existent_file.txt");
+        paths_to_delete.push(non_existent_path);
+        let mock_metrics = Arc::new(MockMetrics) as Arc<dyn MetricsTrait>;
+        // Call the function to delete the data
+        let result = delete_data_paths(mock_metrics, paths_to_delete).await;
+
+        // Since the updated function does not return an error for failed deletions, check for Ok(())
+        assert!(
+            result.is_ok(),
+            "Expected Ok(()) even if some file deletions fail"
+        );
+
+        // Clean up by removing the temporary directory
+        drop(temp_dir);
+
+        // Reset the OUTPUT_DIR environment variable to its original state if necessary
+        std::env::remove_var("OUTPUT_DIR");
+    }
+
+    /// This tests that fs::write does truly overwrite data
+    #[tokio::test]
+    async fn test_overwrite_file_content() {
+        // Dummy data for path
+        let visit_id = Uuid::new_v4();
+        let datetime = Utc::now().naive_utc();
+        let domain_name = "testdomain.com";
+        // Step 1: Get the file path
+        let file_path = get_raw_data_path(datetime, domain_name, visit_id, true)
+            .await
+            .unwrap();
+
+        // Step 2: Write bogus data to the file
+        let bogus_data = "Sample data";
+        std::fs::write(&file_path, bogus_data).expect("Failed to write bogus data");
+
+        // Step 3: Write real (not bogus) data to the same file
+        let real_data = "Correct data";
+        std::fs::write(&file_path, real_data).expect("Failed to write correct data");
+
+        // Step 4: Read back the content of the file
+        let file_content =
+            std::fs::read_to_string(&file_path).expect("Failed to read file content");
+
+        // Step 5: Assert that the file content matches the real data
+        assert_eq!(
+            file_content, real_data,
+            "The file content does not match the expected real data"
+        );
+
+        // Cleanup: Remove the test file
+        std::fs::remove_file(&file_path).expect("Failed to clean up test file");
+    }
+}
