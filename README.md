@@ -1,2 +1,2 @@
-# GitLab-Commit-History
+# My Gitlab commit history from my 8 month long co-op at Noibu
 <img width="1180" alt="image" src="https://github.com/user-attachments/assets/223a220f-0aad-49ad-8251-ca97a475b109">
